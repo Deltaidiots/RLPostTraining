@@ -1,0 +1,176 @@
+@startuml flowchart
+!theme vibrant
+title veRL End-to-End Training Workflow
+
+partition "User Interaction & Setup" {
+    start
+    :User executes training script;
+    note right
+        Example:
+        `./scripts/train_tiny_zero.sh`
+    end note
+    :Hydra/OmegaConf parses CLI args
+    and config files;
+    note right
+        `@hydra.main` in
+        `examples/split_placement/main_ppo_split.py`
+    end note
+    :Initialize Ray Cluster;
+    note right
+        `ray.init()`
+    end note
+    :Launch main driver task as a Ray remote process;
+    note right
+        `ray.get(main_task.remote(config))`
+    end note
+}
+
+partition "Driver Process (Orchestrator)" {
+    :Initialize Tokenizer;
+    :Initialize `RewardManager`;
+    note right
+        Handles both rule-based and
+        model-based reward logic.
+        `verl/rewards/reward_manager.py`
+    end note
+    :Initialize `RayWorkerGroup` for different roles
+    (Actor, Critic, Ref);
+    note right
+        Spawns and manages distributed workers.
+        `docs/workers/ray_trainer.rst`
+    end note
+    :Initialize `Tracking` logger (e.g., WandB);
+    note right
+        `verl/utils/tracking.py`
+    end note
+    :Load `RLHFDataset` from `.parquet` files;
+    note right
+        `docs/examples/ppo_code_architecture.rst`
+    end note
+
+    :Start Training Loop (`for epoch in ...`);
+    note right
+        `verl/trainer/ppo/ray_trainer.py`
+    end note
+}
+
+partition "Ray Workers (Distributed Execution)" {
+    split
+        :<b>ActorRolloutRefWorker</b> loads
+        Actor & Reference models;
+        note left
+            Uses FSDP or Megatron-LM
+            for model parallelism.
+            `verl/workers/fsdp_workers.py`
+        end note
+    split again
+        :<b>CriticWorker</b> loads
+        Critic model;
+    split again
+        :<b>RewardModelWorker</b> (if used)
+        loads RM model;
+    end split
+}
+
+partition "Driver Process (Orchestrator)" {
+    while (not end of training) is (yes)
+        :Get next batch from Dataloader;
+        note right
+            Data is wrapped in a `DataProto` object.
+        end note
+
+        -> Send batch to Actor Worker;
+
+        partition "ActorRolloutRefWorker" {
+            :<b>[Rollout]</b> Generate sequences
+            using the Actor model;
+            note right
+                Uses efficient engines like vLLM.
+                `actor_rollout_wg.generate_sequences()`
+            end note
+            :<b>[Log-Probs]</b> Compute log-probs for
+            generated tokens using both Actor
+            and Reference models;
+        }
+
+        :Receive `DataProto` with sequences
+        and log-probs from Actor;
+
+        -> Send data to Critic Worker;
+
+        partition "CriticWorker" {
+            :<b>[Values]</b> Compute value estimates
+            for the generated sequences;
+            note right
+                `critic_wg.compute_values()`
+            end note
+        }
+
+        :Receive `DataProto` with values from Critic;
+
+        if (Reward Style is Rule-Based?) then (yes)
+            :Compute reward locally using `RewardManager`;
+            note right
+                e.g., `countdown.compute_score()`
+                Checks `reward_model.style == "rule"`
+                in the data.
+            end note
+        else (no)
+            -> Send data to Reward Model Worker;
+            partition "RewardModelWorker" {
+                :Compute reward using the RM;
+            }
+            :Receive rewards from RM Worker;
+        endif
+
+        :<b>[Advantage Calculation]</b>
+        Compute GAE (advantages & returns)
+        on the driver process;
+        note left
+            **Improvement Idea:**
+            Could this be offloaded to a
+            dedicated utility worker to
+            free up the driver?
+        end note
+
+        -> Send data to Actor & Critic Workers for updates;
+
+        partition "Ray Workers (Distributed Execution)" {
+            split
+                :<b>[Actor Update]</b>
+                Update Actor model weights
+                using PPO objective;
+                note left
+                    `actor_rollout_wg.update_actor()`
+                end note
+            split again
+                :<b>[Critic Update]</b>
+                Update Critic model weights
+                by minimizing value loss;
+                note right
+                    `critic_wg.update_critic()`
+                end note
+            end split
+        }
+
+        :Log metrics (loss, reward, etc.) to WandB;
+        note right
+            `logger.log(data=metrics)`
+        end note
+
+        if (Checkpoint frequency reached?) then (yes)
+            :Save model checkpoints;
+            note left
+                Saves Actor and Critic models.
+                `_save_checkpoint()` in `ray_trainer.py`.
+                **Improvement Idea:**
+                Is this blocking? Could be made
+                asynchronous.
+            end note
+        endif
+
+    endwhile (no)
+}
+
+stop
+@enduml
